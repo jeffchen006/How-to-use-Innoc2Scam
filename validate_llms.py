@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 import sys
 from datetime import datetime
@@ -34,6 +35,17 @@ from openaiPackage.openaiClient import create_client  # noqa: E402
 
 DATASET_PATH = Path("data/innoc2scam/Innoc2Scam-bench.json")
 DEFAULT_LOG_DIR = Path("logs") / "llm_validation"
+DEFAULT_LOG_LEVEL = "INFO"
+
+MAX_TOKEN_OVERRIDE_MODELS = {
+    "anthropic/claude-sonnet-4",
+    "deepseek/deepseek-chat-v3.1",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-pro",
+    "openai/gpt-5",
+    "qwen/qwen3-coder",
+    "x-ai/grok-code-fast-1",
+}
 
 # Prompt template taken verbatim from `validation.py` (generate_code_with_retry)
 PROMPT_TEMPLATE_PREFIX = (
@@ -96,7 +108,9 @@ def deterministic_seed(prompt: str) -> int:
     return int(prompt_hash[:8], 16) % (2**31)
 
 
-def setup_logging(model_identifier: str, log_dir: Path) -> Tuple[logging.Logger, Path, Path, Path]:
+def setup_logging(
+    model_identifier: str, log_dir: Path, log_level: str
+) -> Tuple[logging.Logger, Path, Path, Path]:
     """Configure logging to console and files."""
     sanitized_model = model_identifier.replace("/", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -107,7 +121,8 @@ def setup_logging(model_identifier: str, log_dir: Path) -> Tuple[logging.Logger,
     jsonl_path = run_dir / "responses.jsonl"
 
     logger = logging.getLogger(f"validate_llms.{sanitized_model}.{timestamp}")
-    logger.setLevel(logging.INFO)
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(level)
     logger.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -119,18 +134,36 @@ def setup_logging(model_identifier: str, log_dir: Path) -> Tuple[logging.Logger,
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
+    logger.propagate = False
 
     return logger, run_dir, text_log_path, jsonl_path
 
 
-async def call_model(prompt: str, client, *, seed: int) -> str:
+def normalize_model_identifier(model: str) -> str:
+    """Accept identifiers with either slash or underscore separation."""
+    if "/" in model:
+        return model
+    if "_" in model:
+        provider, remainder = model.split("_", 1)
+        return f"{provider}/{remainder}"
+    return model
+
+
+def resolve_max_tokens(model_identifier: str) -> int:
+    """Return max_tokens value depending on the target model."""
+    if model_identifier in MAX_TOKEN_OVERRIDE_MODELS:
+        return 20000
+    return 2000
+
+
+async def call_model(prompt: str, client, *, seed: int, max_tokens: int) -> str:
     """Execute the LLM request in a thread executor."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
         lambda: client.answer_prompt(
             prompt=prompt,
-            max_tokens=2000,
+            max_tokens=max_tokens,
             temperature=0.0,
             seed=seed,
             top_p=1.0,
@@ -164,6 +197,8 @@ async def process_prompt(
     oracle: MaliciousURLOracle,
     logger: logging.Logger,
     jsonl_handle,
+    *,
+    max_tokens: int,
 ) -> Dict[str, Any]:
     """Process a single prompt sequentially."""
     raw_prompt = prompt_entry.get("prompt", "")
@@ -171,8 +206,10 @@ async def process_prompt(
     seed = deterministic_seed(raw_prompt)
 
     logger.info("🔁 [%d/%d] Requesting completion for prompt index %d", index, total, index - 1)
+    logger.debug("Prompt #%d raw text: %s", index - 1, raw_prompt)
+    logger.debug("Prompt #%d formatted prompt:\n%s", index - 1, formatted_prompt)
     start_time = datetime.now()
-    response_text = await call_model(formatted_prompt, client, seed=seed)
+    response_text = await call_model(formatted_prompt, client, seed=seed, max_tokens=max_tokens)
     duration = (datetime.now() - start_time).total_seconds()
 
     if not response_text:
@@ -196,16 +233,32 @@ async def process_prompt(
         url for url, result in oracle_results.items() if result and result.is_malicious
     ]
 
-    status = "MALICIOUS" if malicious_urls else "SAFE"
-    logger.info(
-        "✅ [%d/%d] %s | URLs found: %d | Malicious: %d | %.2fs",
-        index,
-        total,
-        status,
-        len(urls_found),
-        len(malicious_urls),
-        duration,
-    )
+    if malicious_urls:
+        status = "MALICIOUS"
+        status_icon = "🚨"
+        logger.warning(
+            "%s [%d/%d] %s | URLs found: %d | Malicious: %d | %.2fs",
+            status_icon,
+            index,
+            total,
+            status,
+            len(urls_found),
+            len(malicious_urls),
+            duration,
+        )
+    else:
+        status = "SAFE"
+        status_icon = "✅"
+        logger.info(
+            "%s [%d/%d] %s | URLs found: %d | Malicious: %d | %.2fs",
+            status_icon,
+            index,
+            total,
+            status,
+            len(urls_found),
+            len(malicious_urls),
+            duration,
+        )
 
     record = {
         "prompt_index": index - 1,
@@ -213,6 +266,7 @@ async def process_prompt(
         "formatted_prompt": formatted_prompt,
         "status": status.lower(),
         "duration_seconds": duration,
+        "max_tokens": max_tokens,
         "model_response": response_text,
         "urls_found": urls_found,
         "malicious_urls": malicious_urls,
@@ -258,6 +312,7 @@ def write_prompt_artifacts(record: Dict[str, Any], run_dir: Path) -> None:
         "malicious_urls": record.get("malicious_urls"),
         "oracle_details": record.get("oracle_details"),
         "metadata": record.get("metadata"),
+        "max_tokens": record.get("max_tokens"),
     }
     metadata_path.write_text(json.dumps(metadata_content, indent=2), encoding="utf-8")
 
@@ -268,6 +323,8 @@ def write_prompt_artifacts(record: Dict[str, Any], run_dir: Path) -> None:
         "",
         "Model Response:",
         record.get("model_response", ""),
+        "",
+        f"Max Tokens Used: {record.get('max_tokens')}",
         "",
         "Oracle Summary:",
     ]
@@ -298,20 +355,27 @@ async def run_validation(args: argparse.Namespace) -> None:
     """Orchestrate sequential validation."""
     dataset_path = Path(args.dataset or DATASET_PATH)
     prompts = load_prompts(dataset_path)
+    random.Random(args.seed).shuffle(prompts)
     if args.limit:
         prompts = prompts[: args.limit]
 
+    model_identifier = normalize_model_identifier(args.model)
+    max_tokens = resolve_max_tokens(model_identifier)
+
     log_dir = Path(args.log_dir or DEFAULT_LOG_DIR)
-    logger, run_dir, text_log_path, jsonl_path = setup_logging(args.model, log_dir)
+    logger, run_dir, text_log_path, jsonl_path = setup_logging(
+        model_identifier, log_dir, args.log_level
+    )
     logger.info("🗂 Dataset: %s", dataset_path.resolve())
-    logger.info("🧠 Model: %s", args.model)
+    logger.info("🧠 Model: %s (normalized: %s)", args.model, model_identifier)
     logger.info("📝 Prompts to process: %d", len(prompts))
+    logger.info("🔢 Max tokens per request: %d", max_tokens)
     logger.info("🪵 Log file: %s", text_log_path)
     logger.info("📄 JSONL results: %s", jsonl_path)
     logger.info("📁 Run directory: %s", run_dir)
 
     try:
-        client = create_client(args.model)
+        client = create_client(model_identifier)
     except Exception as exc:
         logger.error("Failed to initialize model client: %s", exc)
         raise SystemExit(1) from exc
@@ -331,6 +395,8 @@ async def run_validation(args: argparse.Namespace) -> None:
         "start_time": datetime.now().isoformat(),
         "model": args.model,
         "dataset": str(dataset_path),
+        "model_normalized": model_identifier,
+        "max_tokens": max_tokens,
     }
 
     dummy_oracle = DummyOracle()
@@ -344,6 +410,7 @@ async def run_validation(args: argparse.Namespace) -> None:
                 oracle if oracle else dummy_oracle,
                 logger,
                 jsonl_handle,
+                max_tokens=max_tokens,
             )
             write_prompt_artifacts(record, run_dir)
             summary["processed"] += 1
@@ -386,7 +453,11 @@ class DummyOracle:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sequential Innoc2Scam validation runner.")
-    parser.add_argument("--model", required=True, help="Model identifier passed to create_client.")
+    parser.add_argument(
+        "--model",
+        default="anthropic_claude-sonnet-4",
+        help="Model identifier passed to create_client (default: %(default)s).",
+    )
     parser.add_argument(
         "--dataset",
         default=str(DATASET_PATH),
@@ -399,9 +470,20 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Limit number of prompts (useful for smoke tests).",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for shuffling prompts (default: %(default)s).",
+    )
+    parser.add_argument(
         "--log-dir",
         default=str(DEFAULT_LOG_DIR),
         help="Directory for log files (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL,
+        help="Logging verbosity (DEBUG, INFO, WARNING, ...). Default: %(default)s.",
     )
     return parser.parse_args(argv)
 

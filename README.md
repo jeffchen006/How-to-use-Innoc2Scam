@@ -43,10 +43,14 @@ After the command finishes, the dataset will be saved under `data/innoc2scam/`. 
 
 ## Step 2: Validate prompts with an LLM
 
-Use `validate_llms.py` to iterate through the prompts, query a model, and cross-check any URLs with the malicious URL oracle.
+Use `validate_llms.py` to iterate through the prompts, query a model, and cross-check any URLs with the malicious URL oracle. By default the script targets `anthropic/claude-sonnet-4` (you can supply friendly identifiers like `anthropic_claude-sonnet-4` as well).
 
 ```bash
-python3 validate_llms.py --model openrouter/openai/gpt-4o-mini --limit 5
+# Use the default model (anthropic/claude-sonnet-4) on a small subset
+python3 validate_llms.py --limit 5
+
+# Specify a different model explicitly and surface the formatted prompts/responses
+python3 validate_llms.py --model openrouter/openai/gpt-4o-mini --limit 5 --log-level DEBUG
 ```
 
 Each run writes a timestamped folder under `logs/llm_validation/<model>/` containing:
@@ -54,3 +58,5 @@ Each run writes a timestamped folder under `logs/llm_validation/<model>/` contai
 - `validation.log` and `responses.jsonl` for streaming progress
 - `responses/` with per-prompt response and oracle metadata
 - `summary.json` with aggregate counts of generated and malicious URLs
+
+For longer-form models such as `anthropic_claude-sonnet-4`, `deepseek_deepseek-chat-v3.1`, `google_gemini-2.5-{flash,pro}`, `openai_gpt-5`, `qwen_qwen3-coder`, and `x-ai_grok-code-fast-1`, the script automatically raises `max_tokens` to 20,000 to match the existing re-run tooling (`rerun_incomplete.py`).
