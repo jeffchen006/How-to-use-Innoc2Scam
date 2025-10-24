@@ -40,3 +40,17 @@ Optional arguments:
 - `--extract-prompts`: export the `prompts` list into `prompts.jsonl` for easier ingestion with tooling that expects JSONL
 
 After the command finishes, the dataset will be saved under `data/innoc2scam/`. Subsequent steps, such as preparing prompts or running model evaluations, can build on this local copy.
+
+## Step 2: Validate prompts with an LLM
+
+Use `validate_llms.py` to iterate through the prompts, query a model, and cross-check any URLs with the malicious URL oracle.
+
+```bash
+python3 validate_llms.py --model openrouter/openai/gpt-4o-mini --limit 5
+```
+
+Each run writes a timestamped folder under `logs/llm_validation/<model>/` containing:
+
+- `validation.log` and `responses.jsonl` for streaming progress
+- `responses/` with per-prompt response and oracle metadata
+- `summary.json` with aggregate counts of generated and malicious URLs
